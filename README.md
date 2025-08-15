@@ -145,7 +145,7 @@ const fullData = await roadmap.getFullProjectData("Agent License Renewal");
     docs: "Documentation text"
   },
   content: {
-    objective: "The primary goal is to make Lurnor...",
+    objective: "The primary goal is...",
     userFlow: "Step 1 – Profile Setup...",
     fullText: "Complete page content..."
   }
@@ -297,11 +297,11 @@ for (const projectName of projectsToUpdate) {
 
 ```typescript
 // Different projects with different databases
-const lurnorRoadmap = createRoadmapFromEnv('lurnor-database-id');
+const Roadmap = createRoadmapFromEnv('database-id');
 const otherProjectRoadmap = createRoadmapFromEnv('other-database-id');
 
 // Update different roadmaps independently
-await lurnorRoadmap.complete("Payment Integration");
+await Roadmap.complete("Payment Integration");
 await otherProjectRoadmap.start("User Authentication");
 ```
 
