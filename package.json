@@ -1,6 +1,6 @@
 {
   "name": "claude-code-notion",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Enterprise-grade TypeScript library for Notion database management with Claude Code integration. Features retry/backoff, idempotency, dry-run mode, structured logging, and CLI.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -8,8 +8,11 @@
     "claude-code-notion": "./bin/claude-code-notion"
   },
   "files": [
-    "dist",
-    "bin"
+    "dist/*.js",
+    "dist/*.d.ts", 
+    "dist/*.map",
+    "bin/claude-code-notion",
+    "README.md"
   ],
   "scripts": {
     "build": "tsc",
@@ -20,20 +23,23 @@
   },
   "keywords": [
     "notion",
-    "claude-code",
-    "project-management",
-    "typescript",
-    "productivity",
-    "api",
-    "database",
     "enterprise",
     "cli",
+    "typescript",
+    "sdk",
+    "database",
+    "project-management",
     "retry",
     "idempotency",
     "dry-run",
-    "logging"
+    "security",
+    "audit",
+    "ci-cd",
+    "production",
+    "api",
+    "productivity"
   ],
-  "author": "Daniel Harris",
+  "author": "Sausaria",
   "license": "MIT",
   "dependencies": {
     "@notionhq/client": "^2.2.15"
@@ -49,10 +55,29 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/danielharris/claude-code-notion.git"
+    "url": "https://github.com/Sausaria/claude-code-notion.git"
   },
   "bugs": {
-    "url": "https://github.com/danielharris/claude-code-notion/issues"
+    "url": "https://github.com/Sausaria/claude-code-notion/issues"
   },
-  "homepage": "https://github.com/danielharris/claude-code-notion#readme"
+  "homepage": "https://github.com/Sausaria/claude-code-notion#readme",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "import": "./dist/index.js"
+    },
+    "./errors": {
+      "types": "./dist/errors.d.ts",
+      "require": "./dist/errors.js"
+    },
+    "./circuit-breaker": {
+      "types": "./dist/circuit-breaker.d.ts",
+      "require": "./dist/circuit-breaker.js"
+    },
+    "./utils": {
+      "types": "./dist/utils.d.ts",
+      "require": "./dist/utils.js"
+    }
+  }
 }
