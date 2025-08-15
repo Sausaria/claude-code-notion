@@ -1,9 +1,139 @@
 # Claude Code Notion
 
+[![npm version](https://img.shields.io/npm/v/claude-code-notion.svg)](https://www.npmjs.com/package/claude-code-notion)
+[![npm downloads](https://img.shields.io/npm/dm/claude-code-notion.svg)](https://www.npmjs.com/package/claude-code-notion)
+[![Notion API](https://img.shields.io/badge/Notion%20API-2022--06--28-black.svg)](https://developers.notion.com)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.0-blue.svg)](https://www.typescriptlang.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-16%2B-brightgreen.svg)](https://nodejs.org)
+[![Security](https://img.shields.io/badge/Security-Enterprise%20Grade-green.svg)](https://github.com/Sausaria/claude-code-notion#security)
+
 **Enterprise-grade TypeScript library and CLI for Notion database management with Claude Code integration.**
 
-[![npm version](https://badge.fury.io/js/claude-code-notion.svg)](https://www.npmjs.com/package/claude-code-notion)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+```bash
+npm install claude-code-notion
+```
+
+## ⚡ Quickstart
+
+```bash
+# Copy-paste to get started in 30 seconds
+npm i claude-code-notion
+export NOTION_API_KEY="secret_xxx" 
+export NOTION_DATABASE_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# Test with dry-run (safe)
+npx claude-code-notion complete "Hello World" --dry-run --json
+# ✅ Expected: { "success": true, "dryRun": true, "correlationId": "ccn-..." }
+
+# Execute for real
+npx claude-code-notion complete "Hello World" --json
+```
+
+## 🎬 See It In Action
+
+<details>
+<summary><strong>CLI: Complete a task (with idempotency)</strong></summary>
+
+```bash
+$ npx claude-code-notion complete "Security Fixes" --idempotent --json
+{
+  "success": true,
+  "result": {
+    "id": "24c697dd-0e1b-8079-8a95-cab8bd49eadd",
+    "title": "Security Fixes", 
+    "status": "Completed",
+    "url": "https://notion.so/Security-Fixes-24c697dd0e1b80798a95cab8bd49eadd"
+  },
+  "correlationId": "ccn-2025-08-15-abc123",
+  "operation": "complete",
+  "idempotent": false,
+  "timestamp": "2025-08-15T10:30:45.123Z"
+}
+```
+</details>
+
+<details>
+<summary><strong>CLI: Batch operations with partial failure handling</strong></summary>
+
+```bash
+$ cat updates.ndjson
+{"task": "API Migration", "status": "Completed"}
+{"task": "Security Audit", "status": "In Progress"}  
+{"task": "Documentation", "status": "Review"}
+
+$ npx claude-code-notion batch updates.ndjson --json
+{
+  "success": true,
+  "result": {
+    "succeeded": 2,
+    "failed": 1,
+    "totalTime": "1.4s",
+    "successfulTasks": [
+      { "task": "API Migration", "status": "Completed", "pageId": "abc-123" },
+      { "task": "Security Audit", "status": "In Progress", "pageId": "def-456" }
+    ],
+    "failedTasks": [
+      { "task": "Documentation", "error": "NotFound", "message": "Task not found in database" }
+    ]
+  },
+  "correlationId": "ccn-2025-08-15-def456"
+}
+```
+</details>
+
+<details>
+<summary><strong>CLI: Health monitoring & circuit breaker status</strong></summary>
+
+```bash
+$ npx claude-code-notion health --json
+{
+  "healthy": true,
+  "correlationId": "ccn-2025-08-15-ghi789",
+  "circuitBreaker": {
+    "state": "CLOSED",
+    "failureCount": 0,
+    "successCount": 47,
+    "nextRetryTime": null
+  },
+  "config": {
+    "databaseId": "24c697dd-0e1b-8079-8a95-cab8bd49eadd",
+    "dryRun": false,
+    "idempotency": true,
+    "apiVersion": "2022-06-28"
+  },
+  "validation": {
+    "valid": true,
+    "properties": ["Project name", "Status", "Priority", "Date"],
+    "missing": []
+  }
+}
+```
+</details>
+
+<details>
+<summary><strong>SDK: Enterprise configuration</strong></summary>
+
+```typescript
+import { createRoadmapFromEnv } from 'claude-code-notion';
+
+const manager = createRoadmapFromEnv(databaseId, {
+  enterprise: {
+    retries: { attempts: 5 },
+    idempotency: { enabled: true, ttlMs: 60000 },
+    timeout: { requestTimeoutMs: 20000 },
+    circuitBreaker: { enabled: true, failureThreshold: 3 },
+    dryRun: false,
+    logger: customAuditLogger
+  }
+});
+
+// Auto-retry with backoff, correlation tracking, idempotency
+const result = await manager.complete("Deploy v2.0");
+// If rate-limited: auto-retry with Retry-After header
+// If unchanged: returns idempotent: true
+```
+</details>
 
 ## Features
 
@@ -13,6 +143,8 @@
 🛡️ **Enterprise Security**: Environment validation, secret redaction, audit trails  
 ⚡ **Performance**: Page ID-based updates, intelligent caching, rate limiting  
 🎯 **Developer UX**: TypeScript support, comprehensive error handling, JSON output
+
+> **🛡️ Security Model**: Token auto-redaction, environment validation, no credential storage, audit trails. [Full Security Details →](#️-security)
 
 ### v2.0 Enterprise Features
 
@@ -57,11 +189,20 @@ await manager.complete('Security Fixes');
 export NOTION_API_KEY="secret_your_token"
 export NOTION_DATABASE_ID="your-database-id"
 
-# Safe preview mode
+# 🔍 Search tasks (always safe)
+npx claude-code-notion search "Security Fixes" --json
+
+# 🧪 Preview changes (always run first)
 npx claude-code-notion complete "Deploy Feature X" --dry-run --idempotent
 
-# Production execution with structured output
+# ✅ Execute with safety controls
 npx claude-code-notion complete "Deploy Feature X" --idempotent --json --retries=5
+
+# 📋 Update task content safely
+npx claude-code-notion update-content "Task" --objective="New goal" --dry-run
+
+# 🔄 Change status with preview
+npx claude-code-notion update-status "Task" "In progress" --dry-run
 
 # Result: {"success": true, "result": {...}} - perfect for monitoring
 ```
@@ -137,7 +278,7 @@ const fullData = await roadmap.getFullProjectData("Agent License Renewal");
     priority: "Medium",
     effort: "M",
     team: ["Backend", "Frontend"],
-    owner: ["Daniel Harris"],
+    owner: ["John Smith"],
     category: ["Compliance"],
     role: ["Student"],
     quarter: ["Q1 2025"],
@@ -145,7 +286,7 @@ const fullData = await roadmap.getFullProjectData("Agent License Renewal");
     docs: "Documentation text"
   },
   content: {
-    objective: "The primary goal is to make Lurnor...",
+    objective: "The primary goal is to enable...",
     userFlow: "Step 1 – Profile Setup...",
     fullText: "Complete page content..."
   }
@@ -297,11 +438,11 @@ for (const projectName of projectsToUpdate) {
 
 ```typescript
 // Different projects with different databases
-const lurnorRoadmap = createRoadmapFromEnv('lurnor-database-id');
-const otherProjectRoadmap = createRoadmapFromEnv('other-database-id');
+const projectARoadmap = createRoadmapFromEnv('project-a-database-id');
+const projectBRoadmap = createRoadmapFromEnv('project-b-database-id');
 
 // Update different roadmaps independently
-await lurnorRoadmap.complete("Payment Integration");
+await projectARoadmap.complete("Payment Integration");
 await otherProjectRoadmap.start("User Authentication");
 ```
 

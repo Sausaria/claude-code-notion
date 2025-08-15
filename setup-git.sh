@@ -4,7 +4,7 @@
 echo "🚀 Setting up claude-code-notion Git repository..."
 
 # Navigate to package root
-cd /Users/danielharris/claude-code-notion
+cd "$(dirname "$0")"
 
 # Initialize git if not already done
 if [ ! -d ".git" ]; then

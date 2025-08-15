@@ -1,4 +1,19 @@
 import { Client } from '@notionhq/client';
+import { CcnError, EXIT_CODES, getExitCode } from './errors';
+import { CircuitBreaker, CircuitBreakerConfig } from './circuit-breaker';
+import {
+  generateCorrelationId,
+  redactSecrets,
+  isPlaceholder,
+  createTimeoutSignal,
+  sleep,
+  getKillSwitches,
+  parseEnvBoolean,
+  parseEnvNumber,
+  getNotionVersion,
+  getUserAgent,
+  collectPages
+} from './utils';
 
 // Enterprise logging interface
 export interface Logger {
@@ -8,13 +23,32 @@ export interface Logger {
   event?(type: string, meta?: Record<string, unknown>): void;
 }
 
-// Default console logger
+// Default console logger with redaction
 export const defaultLogger: Logger = {
-  info: (msg, meta) => console.log(`[INFO] ${msg}`, meta || ''),
-  warn: (msg, meta) => console.warn(`[WARN] ${msg}`, meta || ''),
-  error: (msg, meta) => console.error(`[ERROR] ${msg}`, meta || ''),
-  event: (type, meta) => console.log(`[EVENT:${type}]`, meta || '')
+  info: (msg, meta) => console.log(`[INFO] ${msg}`, redactMeta(meta)),
+  warn: (msg, meta) => console.warn(`[WARN] ${msg}`, redactMeta(meta)),
+  error: (msg, meta) => console.error(`[ERROR] ${msg}`, redactMeta(meta)),
+  event: (type, meta) => console.log(`[EVENT:${type}]`, redactMeta(meta))
 };
+
+function redactMeta(meta?: Record<string, unknown>): Record<string, unknown> | string {
+  if (!meta) return '';
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(meta)) {
+    if (typeof value === 'string' && (key.toLowerCase().includes('key') || key.toLowerCase().includes('token'))) {
+      redacted[key] = redactSecrets(value);
+    } else {
+      redacted[key] = value;
+    }
+  }
+  return redacted;
+}
+
+// Timeout configuration
+export interface TimeoutConfig {
+  requestTimeoutMs?: number;    // Per-request timeout
+  globalTimeoutMs?: number;      // Global operation timeout
+}
 
 // Retry configuration
 export interface RetryConfig {
@@ -28,15 +62,27 @@ export interface RetryConfig {
 // Idempotency configuration
 export interface IdempotencyConfig {
   enabled?: boolean;
+  ttlMs?: number;  // How long to remember operations
+}
+
+// Schema validation configuration
+export interface SchemaConfig {
+  validateOnStartup?: boolean;
+  requiredProperties?: string[];
+  propertyMapping?: Record<string, string>;
 }
 
 // Enterprise options for the SDK
 export interface EnterpriseOptions {
   retries?: RetryConfig;
   idempotency?: IdempotencyConfig;
+  circuitBreaker?: Partial<CircuitBreakerConfig>;
+  timeout?: TimeoutConfig;
+  schema?: SchemaConfig;
   dryRun?: boolean;
   logger?: Logger;
   redactSecrets?: boolean;
+  correlationId?: string;  // Allow passing in correlation ID
 }
 
 // Core configuration interface
@@ -46,7 +92,6 @@ export interface RoadmapConfig {
   titleProperty?: string;
   statusProperty?: string;
   dateProperty?: string;
-  // Enterprise options (opt-in)
   enterprise?: EnterpriseOptions;
 }
 
@@ -65,13 +110,49 @@ export interface RoadmapTask {
   properties: Record<string, any>;
 }
 
+// Track idempotent operations
+interface IdempotencyKey {
+  pageId: string;
+  operation: string;
+  payloadHash: string;
+  timestamp: number;
+}
+
 export class NotionRoadmapManager {
   private client: Client;
   private config: Required<RoadmapConfig>;
   private enterprise: Required<EnterpriseOptions>;
   private logger: Logger;
+  private circuitBreaker: CircuitBreaker;
+  private idempotencyCache: Map<string, IdempotencyKey> = new Map();
+  private correlationId: string;
+  private propertyIds: Record<string, string> = {};
 
   constructor(config: RoadmapConfig) {
+    // Generate or use provided correlation ID
+    this.correlationId = config.enterprise?.correlationId || generateCorrelationId();
+    
+    // Validate API key
+    if (isPlaceholder(config.apiKey)) {
+      throw new CcnError({
+        type: 'Validation',
+        message: 'API key appears to be a placeholder. Please provide a valid Notion API key.',
+        retryable: false,
+        correlationId: this.correlationId
+      });
+    }
+
+    // Check kill switches
+    const killSwitches = getKillSwitches();
+    if (killSwitches.networkDisabled) {
+      throw new CcnError({
+        type: 'Validation',
+        message: 'Network disabled via CCN_NETWORK_DISABLED environment variable',
+        retryable: false,
+        correlationId: this.correlationId
+      });
+    }
+
     this.config = {
       titleProperty: "Project name",
       statusProperty: "Status",
@@ -80,921 +161,768 @@ export class NotionRoadmapManager {
       ...config
     };
 
-    // Setup enterprise defaults
+    // Setup enterprise defaults with environment overrides
     this.enterprise = {
       retries: {
-        attempts: 3,
-        minDelayMs: 1000,
-        maxDelayMs: 30000,
-        jitter: true,
+        attempts: parseEnvNumber(process.env.CCN_RETRY_ATTEMPTS, 3),
+        minDelayMs: parseEnvNumber(process.env.CCN_RETRY_MIN_DELAY, 1000),
+        maxDelayMs: parseEnvNumber(process.env.CCN_RETRY_MAX_DELAY, 30000),
+        jitter: parseEnvBoolean(process.env.CCN_RETRY_JITTER, true),
         respectRetryAfter: true,
         ...config.enterprise?.retries
       },
       idempotency: {
-        enabled: false,
+        enabled: parseEnvBoolean(process.env.CCN_IDEMPOTENCY, false),
+        ttlMs: parseEnvNumber(process.env.CCN_IDEMPOTENCY_TTL, 60000),
         ...config.enterprise?.idempotency
       },
-      dryRun: config.enterprise?.dryRun || false,
+      timeout: {
+        requestTimeoutMs: parseEnvNumber(process.env.CCN_REQUEST_TIMEOUT, 15000),
+        globalTimeoutMs: parseEnvNumber(process.env.CCN_GLOBAL_TIMEOUT, 120000),
+        ...config.enterprise?.timeout
+      },
+      circuitBreaker: {
+        enabled: parseEnvBoolean(process.env.CCN_CIRCUIT_BREAKER, true),
+        failureThreshold: parseEnvNumber(process.env.CCN_CIRCUIT_THRESHOLD, 5),
+        resetTimeoutMs: parseEnvNumber(process.env.CCN_CIRCUIT_RESET, 60000),
+        successThreshold: parseEnvNumber(process.env.CCN_CIRCUIT_SUCCESS, 2),
+        ...config.enterprise?.circuitBreaker
+      },
+      schema: {
+        validateOnStartup: parseEnvBoolean(process.env.CCN_SCHEMA_VALIDATE, true),
+        ...config.enterprise?.schema
+      },
+      dryRun: parseEnvBoolean(process.env.CCN_WRITE_DISABLED) || config.enterprise?.dryRun || false,
       logger: config.enterprise?.logger || defaultLogger,
-      redactSecrets: config.enterprise?.redactSecrets !== false
+      redactSecrets: config.enterprise?.redactSecrets !== false,
+      correlationId: this.correlationId
     };
 
     this.logger = this.enterprise.logger;
     
+    // Initialize circuit breaker
+    this.circuitBreaker = new CircuitBreaker(this.enterprise.circuitBreaker as CircuitBreakerConfig);
+
     this.client = new Client({
-      auth: this.config.apiKey,
+      auth: config.apiKey,
+      timeoutMs: this.enterprise.timeout.requestTimeoutMs,
+      notionVersion: getNotionVersion()
     });
+
+    // Log initialization
+    this.logger.info('NotionRoadmapManager initialized', {
+      correlationId: this.correlationId,
+      databaseId: config.databaseId,
+      dryRun: this.enterprise.dryRun,
+      circuitBreakerEnabled: this.enterprise.circuitBreaker.enabled,
+      idempotencyEnabled: this.enterprise.idempotency.enabled
+    });
+
+    // Validate schema if configured
+    if (this.enterprise.schema.validateOnStartup) {
+      this.validateSchema().catch(err => {
+        this.logger.error('Schema validation failed', { error: err.message, correlationId: this.correlationId });
+      });
+    }
   }
 
   /**
-   * Execute operation with retry/backoff logic
+   * Validate database schema matches expected configuration
    */
-  private async withRetry<T>(
+  private async validateSchema(): Promise<void> {
+    try {
+      const database = await this.client.databases.retrieve({
+        database_id: this.config.databaseId
+      });
+
+      const properties = (database as any).properties;
+      const requiredProps = this.enterprise.schema.requiredProperties || [
+        this.config.titleProperty,
+        this.config.statusProperty
+      ];
+
+      // Store property IDs for resilience
+      this.propertyIds = {};
+      for (const [name, prop] of Object.entries(properties)) {
+        this.propertyIds[name] = (prop as any).id;
+      }
+
+      const missing = requiredProps.filter(prop => !properties[prop]);
+      if (missing.length > 0) {
+        throw new CcnError({
+          type: 'Validation',
+          message: `Missing required database properties: ${missing.join(', ')}`,
+          retryable: false,
+          correlationId: this.correlationId,
+          metadata: { missing, available: Object.keys(properties) }
+        });
+      }
+
+      // Check if database is archived
+      if ((database as any).archived) {
+        throw new CcnError({
+          type: 'Validation',
+          message: 'Database is archived and cannot be modified',
+          retryable: false,
+          correlationId: this.correlationId
+        });
+      }
+
+      this.logger.info('Schema validation successful', {
+        correlationId: this.correlationId,
+        properties: Object.keys(properties),
+        propertyIds: this.propertyIds
+      });
+    } catch (error) {
+      throw CcnError.fromNotionError(error, this.correlationId);
+    }
+  }
+
+  /**
+   * Check if operation was recently performed (idempotency)
+   */
+  private checkIdempotency(key: string): boolean {
+    if (!this.enterprise.idempotency.enabled) return false;
+    
+    const cached = this.idempotencyCache.get(key);
+    if (!cached) return false;
+    
+    const age = Date.now() - cached.timestamp;
+    if (age > this.enterprise.idempotency.ttlMs!) {
+      this.idempotencyCache.delete(key);
+      return false;
+    }
+    
+    return true;
+  }
+
+  /**
+   * Record operation for idempotency
+   */
+  private recordIdempotency(pageId: string, operation: string, payload: any): void {
+    if (!this.enterprise.idempotency.enabled) return;
+    
+    const payloadHash = JSON.stringify(payload);
+    const key = `${pageId}-${operation}-${payloadHash}`;
+    
+    this.idempotencyCache.set(key, {
+      pageId,
+      operation,
+      payloadHash,
+      timestamp: Date.now()
+    });
+    
+    // Clean old entries
+    for (const [k, v] of this.idempotencyCache.entries()) {
+      if (Date.now() - v.timestamp > this.enterprise.idempotency.ttlMs!) {
+        this.idempotencyCache.delete(k);
+      }
+    }
+  }
+
+  /**
+   * Execute operation with circuit breaker, retries, and timeout
+   */
+  private async executeWithResilience<T>(
     operation: () => Promise<T>,
     operationName: string,
-    metadata: Record<string, unknown> = {}
+    metadata: Record<string, any> = {}
+  ): Promise<T> {
+    const operationId = generateCorrelationId();
+    
+    // Check kill switches
+    const killSwitches = getKillSwitches();
+    if (killSwitches.networkDisabled) {
+      throw new CcnError({
+        type: 'Validation',
+        message: 'Network operations disabled via CCN_NETWORK_DISABLED',
+        retryable: false,
+        correlationId: this.correlationId
+      });
+    }
+
+    // Execute with circuit breaker
+    return this.circuitBreaker.execute(
+      () => this.executeWithRetry(operation, operationName, { ...metadata, operationId }),
+      this.correlationId
+    );
+  }
+
+  /**
+   * Execute operation with retry logic
+   */
+  private async executeWithRetry<T>(
+    operation: () => Promise<T>,
+    operationName: string,
+    metadata: Record<string, any> = {}
   ): Promise<T> {
     const { attempts, minDelayMs, maxDelayMs, jitter, respectRetryAfter } = this.enterprise.retries;
     let lastError: any;
 
     for (let attempt = 1; attempt <= attempts!; attempt++) {
       try {
-        const result = await operation();
+        this.logger.info(`Attempting ${operationName}`, {
+          attempt,
+          maxAttempts: attempts,
+          correlationId: this.correlationId,
+          ...metadata
+        });
+
+        // Create timeout promise
+        const timeoutMs = this.enterprise.timeout.requestTimeoutMs!;
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          setTimeout(() => {
+            reject(new CcnError({
+              type: 'Timeout',
+              message: `Operation timed out after ${timeoutMs}ms`,
+              retryable: true,
+              correlationId: this.correlationId
+            }));
+          }, timeoutMs);
+        });
+
+        // Race operation against timeout
+        const result = await Promise.race([operation(), timeoutPromise]);
         
-        if (attempt > 1) {
-          this.logger.info(`Operation succeeded on attempt ${attempt}`, {
-            operation: operationName,
-            attempt,
-            ...metadata
-          });
-        }
+        this.logger.info(`${operationName} succeeded`, {
+          attempt,
+          correlationId: this.correlationId,
+          ...metadata
+        });
         
         return result;
       } catch (error: any) {
         lastError = error;
         
-        this.logger.warn(`Attempt ${attempt} failed`, {
-          operation: operationName,
+        // Convert to typed error
+        const ccnError = error instanceof CcnError ? error : CcnError.fromNotionError(error, this.correlationId);
+        
+        this.logger.warn(`${operationName} failed`, {
           attempt,
-          error: error.message,
-          code: error.code,
-          status: error.status,
+          error: ccnError.message,
+          type: ccnError.type,
+          retryable: ccnError.retryable,
+          correlationId: this.correlationId,
           ...metadata
         });
-        
-        // Don't retry on authentication or client errors (4xx except 429)
-        if (error.status && error.status >= 400 && error.status < 500 && error.status !== 429) {
-          break;
+
+        // Don't retry if not retryable
+        if (!ccnError.retryable || attempt === attempts) {
+          throw ccnError;
         }
-        
-        // Don't retry on final attempt
-        if (attempt === attempts!) {
-          break;
-        }
-        
-        // Calculate delay with jitter
-        const baseDelay = Math.min(
-          minDelayMs! * Math.pow(2, attempt - 1),
-          maxDelayMs!
-        );
-        const finalDelay = jitter 
-          ? baseDelay + (baseDelay * 0.1 * Math.random())
-          : baseDelay;
-        
-        // Honor Retry-After header if present and configured
-        const retryAfter = respectRetryAfter && error.headers?.['retry-after'];
+
+        // Calculate delay
+        const baseDelay = Math.min(minDelayMs! * Math.pow(2, attempt - 1), maxDelayMs!);
+        const finalDelay = jitter ? baseDelay + (baseDelay * 0.1 * Math.random()) : baseDelay;
+
+        // Honor Retry-After header
+        const retryAfter = respectRetryAfter && ccnError.metadata?.retryAfter;
         const delay = retryAfter ? parseInt(retryAfter) * 1000 : finalDelay;
-        
+
         this.logger.info(`Retrying in ${Math.round(delay)}ms`, {
-          operation: operationName,
           attempt,
           delay,
-          retryAfter: !!retryAfter
+          correlationId: this.correlationId
         });
-        
-        await new Promise(resolve => setTimeout(resolve, delay));
+
+        await sleep(delay);
       }
     }
-    
-    this.logger.error(`Operation failed after ${attempts!} attempts`, {
-      operation: operationName,
-      attempts: attempts!,
-      error: lastError.message,
-      ...metadata
-    });
-    
+
     throw lastError;
   }
 
   /**
-   * Check if values have changed for idempotency
+   * Get health status of the service
    */
-  private hasChanged(current: string | undefined, incoming: string | undefined): boolean {
-    if (!current && !incoming) return false;
-    if (!current || !incoming) return true;
-    
-    const normalize = (str: string) => str.trim().toLowerCase();
-    return normalize(current) !== normalize(incoming);
+  async health(): Promise<{
+    healthy: boolean;
+    correlationId: string;
+    circuitBreaker: any;
+    config: {
+      databaseId: string;
+      dryRun: boolean;
+      idempotency: boolean;
+    };
+    validation?: any;
+  }> {
+    const status = {
+      healthy: true,
+      correlationId: this.correlationId,
+      circuitBreaker: this.circuitBreaker.getStatus(),
+      config: {
+        databaseId: this.config.databaseId,
+        dryRun: this.enterprise.dryRun,
+        idempotency: this.enterprise.idempotency.enabled!
+      },
+      validation: null as any
+    };
+
+    try {
+      await this.validateSchema();
+      status.validation = { valid: true };
+    } catch (error: any) {
+      status.healthy = false;
+      status.validation = { valid: false, error: error.message };
+    }
+
+    return status;
   }
 
   /**
    * Update a task's status by name or ID
    */
   async updateTask(taskIdentifier: string, status: string): Promise<RoadmapTask> {
-    return this.withRetry(async () => {
+    // Check for dry run or write disabled
+    if (this.enterprise.dryRun || getKillSwitches().writeDisabled) {
+      this.logger.info('DRY RUN: Would update task', {
+        taskIdentifier,
+        status,
+        correlationId: this.correlationId
+      });
+      return { id: 'dry-run', title: taskIdentifier, status } as RoadmapTask;
+    }
+
+    return this.executeWithResilience(async () => {
       const today = new Date().toISOString().split('T')[0];
-      
       let pageId: string;
-      let currentTask: any;
-      
-      // Check if taskIdentifier is a page ID (contains hyphens) or task name
+
+      // Check if taskIdentifier is a page ID or task name
       if (taskIdentifier.includes('-') && taskIdentifier.length > 20) {
         pageId = taskIdentifier;
-        // Get current task for idempotency check
-        if (this.enterprise.idempotency.enabled) {
-          currentTask = await this.client.pages.retrieve({ page_id: pageId });
-        }
       } else {
         // Search for the task by name
-        const response = await this.client.databases.query({
-          database_id: this.config.databaseId,
-          filter: {
-            property: this.config.titleProperty,
-            title: {
-              contains: taskIdentifier,
-            },
-          },
-        });
+        const results = await this.search(taskIdentifier);
+        if (results.length === 0) {
+          throw new CcnError({
+            type: 'NotFound',
+            message: `Task "${taskIdentifier}" not found in the roadmap`,
+            retryable: false,
+            correlationId: this.correlationId
+          });
+        }
+        pageId = results[0].id;
+      }
 
-        if (response.results.length === 0) {
-          throw new Error(`Task "${taskIdentifier}" not found in database ${this.config.databaseId}`);
-        }
-        
-        currentTask = response.results[0];
-        pageId = currentTask.id;
-      }
-      
-      // Idempotency check
-      if (this.enterprise.idempotency.enabled && currentTask) {
-        const currentStatus = this.extractStatus(currentTask);
-        if (currentStatus === status) {
-          this.logger.info('Status unchanged - skipping update', {
-            operation: 'updateTask',
-            taskIdentifier,
-            pageId,
-            status,
-            idempotent: true
-          });
-          
-          this.logger.event?.('audit', {
-            operation: 'updateTask',
-            pageId,
-            status: 'idempotent',
-            changes: { status: false }
-          });
-          
-          return this.formatTask(currentTask);
-        }
-      }
-      
-      // Dry run check
-      if (this.enterprise.dryRun) {
-        this.logger.info('[DRY RUN] Would update task status', {
-          operation: 'updateTask',
-          taskIdentifier,
+      // Check idempotency
+      const idempotencyKey = `${pageId}-updateStatus-${status}`;
+      if (this.checkIdempotency(idempotencyKey)) {
+        this.logger.info('Skipping duplicate operation (idempotency)', {
           pageId,
-          statusFrom: currentTask ? this.extractStatus(currentTask) : 'unknown',
-          statusTo: status,
-          dryRun: true
+          operation: 'updateStatus',
+          correlationId: this.correlationId
         });
-        
-        this.logger.event?.('audit', {
-          operation: 'updateTask',
-          pageId,
-          status: 'dry-run',
-          changes: { status: true }
+        return this.getTaskById(pageId);
+      }
+
+      // Preflight check: verify page exists and is not archived
+      const currentPage = await this.client.pages.retrieve({ page_id: pageId });
+      if ((currentPage as any).archived) {
+        throw new CcnError({
+          type: 'Validation',
+          message: 'Cannot update archived page',
+          retryable: false,
+          correlationId: this.correlationId
         });
-        
-        return this.formatTask(currentTask || { id: pageId, properties: {} });
       }
-      
-      // Prepare update data
-      const updateData: any = {
-        [this.config.statusProperty]: {
-          status: { name: status },
-        },
-      };
-      
-      // Add date field for completed or in-progress status
-      if (status.toLowerCase() === 'completed' || status.toLowerCase() === 'in progress') {
-        updateData[this.config.dateProperty] = {
-          date: {
-            start: today,
-          },
-        };
-      }
-      
-      this.logger.info('Updating task status', {
-        operation: 'updateTask',
-        taskIdentifier,
-        pageId,
-        statusFrom: currentTask ? this.extractStatus(currentTask) : 'unknown',
-        statusTo: status
-      });
-      
+
+      // Use property IDs if available for resilience
+      const statusPropId = this.propertyIds[this.config.statusProperty] || this.config.statusProperty;
+      const datePropId = this.propertyIds[this.config.dateProperty] || this.config.dateProperty;
+
+      // Update the task
       const response = await this.client.pages.update({
         page_id: pageId,
-        properties: updateData,
+        properties: {
+          [statusPropId]: {
+            select: { name: status }
+          },
+          [datePropId]: {
+            date: { start: today }
+          }
+        }
       });
-      
-      this.logger.event?.('audit', {
-        operation: 'updateTask',
-        pageId,
-        status: 'success',
-        changes: { status: true }
-      });
-      
-      return this.formatTask(response as any);
+
+      // Record idempotency
+      this.recordIdempotency(pageId, 'updateStatus', { status });
+
+      return this.parseTask(response);
     }, 'updateTask', { taskIdentifier, status });
   }
 
   /**
-   * Mark a task as completed
+   * Get task by ID
+   */
+  private async getTaskById(pageId: string): Promise<RoadmapTask> {
+    const page = await this.client.pages.retrieve({ page_id: pageId });
+    return this.parseTask(page);
+  }
+
+  /**
+   * Parse Notion page to RoadmapTask
+   */
+  private parseTask(page: any): RoadmapTask {
+    const props = page.properties;
+    
+    return {
+      id: page.id,
+      title: this.getPropertyValue(props[this.config.titleProperty]),
+      status: this.getPropertyValue(props[this.config.statusProperty]),
+      priority: this.getPropertyValue(props.Priority),
+      url: page.url,
+      properties: props
+    };
+  }
+
+  /**
+   * Get property value from Notion property
+   */
+  private getPropertyValue(property: any): string {
+    if (!property) return '';
+    
+    switch (property.type) {
+      case 'title':
+        return property.title[0]?.plain_text || '';
+      case 'rich_text':
+        return property.rich_text[0]?.plain_text || '';
+      case 'select':
+        return property.select?.name || '';
+      case 'multi_select':
+        return property.multi_select.map((s: any) => s.name).join(', ');
+      case 'date':
+        return property.date?.start || '';
+      case 'number':
+        return property.number?.toString() || '';
+      case 'checkbox':
+        return property.checkbox ? 'Yes' : 'No';
+      case 'url':
+        return property.url || '';
+      case 'email':
+        return property.email || '';
+      case 'phone_number':
+        return property.phone_number || '';
+      default:
+        return '';
+    }
+  }
+
+  /**
+   * Search for tasks with enhanced filters
+   */
+  async search(query: string, options?: {
+    filter?: 'page' | 'database';
+    sort?: 'last_edited' | 'created';
+    includeArchived?: boolean;
+  }): Promise<RoadmapTask[]> {
+    return this.executeWithResilience(async () => {
+      // Use property ID if available for resilience
+      const titlePropId = this.propertyIds[this.config.titleProperty] || this.config.titleProperty;
+      
+      const queryOptions: any = {
+        database_id: this.config.databaseId,
+        filter: {
+          and: [
+            {
+              property: titlePropId,
+              title: { contains: query }
+            }
+          ]
+        },
+        page_size: 100
+      };
+
+      // Add archived filter
+      if (!options?.includeArchived) {
+        queryOptions.filter.and.push({
+          property: 'archived',
+          checkbox: { equals: false }
+        });
+      }
+
+      // Add sort
+      if (options?.sort) {
+        queryOptions.sorts = [{
+          timestamp: options.sort === 'last_edited' ? 'last_edited_time' : 'created_time',
+          direction: 'descending'
+        }];
+      }
+
+      // Collect all pages with pagination
+      const allResults = await collectPages(async (cursor) => {
+        const response = await this.client.databases.query({
+          ...queryOptions,
+          start_cursor: cursor
+        });
+        return {
+          results: response.results,
+          has_more: response.has_more,
+          next_cursor: response.next_cursor
+        };
+      });
+
+      return allResults.map(page => this.parseTask(page));
+    }, 'search', { query, options });
+  }
+
+  /**
+   * Mark task as completed
    */
   async complete(taskName: string): Promise<RoadmapTask> {
     return this.updateTask(taskName, "Completed");
   }
 
   /**
-   * Mark a task as in progress
+   * Mark task as in progress
    */
   async start(taskName: string): Promise<RoadmapTask> {
     return this.updateTask(taskName, "In progress");
   }
 
   /**
-   * Mark a task as planned
+   * Mark task as planned
    */
   async plan(taskName: string): Promise<RoadmapTask> {
     return this.updateTask(taskName, "Planned");
   }
 
   /**
-   * Search for tasks by name
+   * List all tasks with pagination
    */
-  async search(query: string): Promise<RoadmapTask[]> {
-    const response = await this.client.databases.query({
-      database_id: this.config.databaseId,
-      filter: {
-        property: this.config.titleProperty,
-        title: {
-          contains: query,
-        },
-      },
-    });
+  async list(options?: {
+    pageSize?: number;
+    includeArchived?: boolean;
+  }): Promise<RoadmapTask[]> {
+    return this.executeWithResilience(async () => {
+      const queryOptions: any = {
+        database_id: this.config.databaseId,
+        page_size: options?.pageSize || 100
+      };
 
-    const tasksWithContent = await Promise.all(
-      response.results.map(async (page: any) => {
-        const pageContent = await this.getPageContent(page.id);
-        return this.formatTask(page, pageContent);
-      })
-    );
+      // Filter out archived by default
+      if (!options?.includeArchived) {
+        queryOptions.filter = {
+          property: 'archived',
+          checkbox: { equals: false }
+        };
+      }
 
-    return tasksWithContent;
-  }
+      // Collect all pages with pagination
+      const allResults = await collectPages(async (cursor) => {
+        const response = await this.client.databases.query({
+          ...queryOptions,
+          start_cursor: cursor
+        });
+        return {
+          results: response.results,
+          has_more: response.has_more,
+          next_cursor: response.next_cursor
+        };
+      });
 
-  /**
-   * List all tasks in the roadmap
-   */
-  async list(): Promise<RoadmapTask[]> {
-    const response = await this.client.databases.query({
-      database_id: this.config.databaseId,
-    });
-
-    // For list view, we don't need full page content (performance optimization)
-    return response.results.map(page => this.formatTask(page as any, ''));
+      return allResults.map(page => this.parseTask(page));
+    }, 'list', { options });
   }
 
   /**
    * Get tasks by status
    */
   async getByStatus(status: string): Promise<RoadmapTask[]> {
-    const response = await this.client.databases.query({
-      database_id: this.config.databaseId,
-      filter: {
-        property: this.config.statusProperty,
-        status: {
-          equals: status,
-        },
-      },
-    });
-
-    return response.results.map(page => this.formatTask(page as any, ''));
-  }
-
-  /**
-   * Update page content (objective and user flow sections)
-   */
-  async updatePageContent(taskIdentifier: string, content: { objective?: string; userFlow?: string; notes?: string }): Promise<void> {
-    let pageId: string;
-    
-    // Get page ID (same logic as updateTask)
-    if (taskIdentifier.includes('-') && taskIdentifier.length > 20) {
-      pageId = taskIdentifier;
-    } else {
+    return this.executeWithResilience(async () => {
       const response = await this.client.databases.query({
         database_id: this.config.databaseId,
         filter: {
-          property: this.config.titleProperty,
-          title: {
-            contains: taskIdentifier,
-          },
-        },
+          property: this.config.statusProperty,
+          select: { equals: status }
+        }
       });
 
-      if (response.results.length === 0) {
-        throw new Error(`Task "${taskIdentifier}" not found in database`);
-      }
-      
-      pageId = response.results[0].id;
-    }
-
-    // Get existing blocks
-    const existingBlocks = await this.client.blocks.children.list({
-      block_id: pageId,
-    });
-
-    // Parse existing content to find objective and user flow sections
-    const updatedBlocks = this.updateContentBlocks(existingBlocks.results, content);
-
-    // Replace all page content
-    await this.replacePageContent(pageId, updatedBlocks);
+      return response.results.map(page => this.parseTask(page));
+    }, 'getByStatus', { status });
   }
 
   /**
-   * Get ALL project data including properties and content
+   * Get circuit breaker status
    */
-  async getFullProjectData(taskIdentifier: string): Promise<{
-    id: string;
-    title: string;
-    url: string;
-    properties: {
-      status?: string;
-      priority?: string;
-      effort?: string;
-      team?: string[];
-      owner?: string[];
-      category?: string[];
-      role?: string[];
-      quarter?: string[];
-      date?: string;
-      docs?: string;
-    };
-    content: {
-      objective?: string;
-      userFlow?: string;
-      fullText: string;
-    };
+  getCircuitStatus() {
+    return this.circuitBreaker.getStatus();
+  }
+
+  /**
+   * Reset circuit breaker
+   */
+  resetCircuit() {
+    this.circuitBreaker.reset();
+    this.logger.info('Circuit breaker reset', { correlationId: this.correlationId });
+  }
+
+  /**
+   * Batch update multiple tasks
+   */
+  async batchUpdate(updates: Array<{ taskIdentifier: string; status: string }>, options?: {
+    concurrency?: number;
+    continueOnError?: boolean;
+  }): Promise<{
+    succeeded: RoadmapTask[];
+    failed: Array<{ taskIdentifier: string; error: string }>;
   }> {
-    let pageId: string;
-    let page: any;
-    
-    if (taskIdentifier.includes('-') && taskIdentifier.length > 20) {
-      pageId = taskIdentifier;
-      // Fetch the page to get properties
-      page = await this.client.pages.retrieve({ page_id: pageId });
-    } else {
-      const response = await this.client.databases.query({
-        database_id: this.config.databaseId,
-        filter: {
-          property: this.config.titleProperty,
-          title: {
-            contains: taskIdentifier,
-          },
-        },
+    const concurrency = options?.concurrency || 3;
+    const succeeded: RoadmapTask[] = [];
+    const failed: Array<{ taskIdentifier: string; error: string }> = [];
+
+    // Process in batches
+    for (let i = 0; i < updates.length; i += concurrency) {
+      const batch = updates.slice(i, i + concurrency);
+      const promises = batch.map(async ({ taskIdentifier, status }) => {
+        try {
+          const result = await this.updateTask(taskIdentifier, status);
+          succeeded.push(result);
+        } catch (error: any) {
+          const errorMessage = error instanceof CcnError ? error.message : String(error);
+          failed.push({ taskIdentifier, error: errorMessage });
+          
+          if (!options?.continueOnError) {
+            throw error;
+          }
+        }
       });
 
-      if (response.results.length === 0) {
-        throw new Error(`Task "${taskIdentifier}" not found in database`);
-      }
-      
-      page = response.results[0];
-      pageId = page.id;
+      await Promise.allSettled(promises);
     }
 
-    // Get page content
-    const pageContent = await this.getPageContent(pageId);
-    const { objective, userFlow } = this.extractObjectiveAndUserFlow({}, pageContent);
-    
-    // Extract all properties
-    const props = page.properties || {};
-    
-    return {
-      id: pageId,
-      title: this.extractTitle(page),
-      url: page.url,
-      properties: {
-        status: this.extractStatus(page),
-        priority: this.extractPriority(page),
-        effort: this.extractSelect(page, 'Effort'),
-        team: this.extractMultiSelect(page, 'Team'),
-        owner: this.extractPeople(page, 'Owner'),
-        category: this.extractMultiSelect(page, 'Category'),
-        role: this.extractMultiSelect(page, 'Role'),
-        quarter: this.extractMultiSelect(page, 'Quarter'),
-        date: this.extractDate(page, 'Date'),
-        docs: this.extractRichText(page, 'Docs'),
-      },
-      content: {
-        objective,
-        userFlow,
-        fullText: pageContent
-      }
-    };
+    this.logger.info('Batch update completed', {
+      correlationId: this.correlationId,
+      succeeded: succeeded.length,
+      failed: failed.length
+    });
+
+    return { succeeded, failed };
   }
 
   /**
-   * Get detailed page content for a specific task
+   * Get statistics about tasks
    */
-  async getTaskDetails(taskIdentifier: string): Promise<{ objective?: string; userFlow?: string; fullContent: string }> {
-    let pageId: string;
-    
-    if (taskIdentifier.includes('-') && taskIdentifier.length > 20) {
-      pageId = taskIdentifier;
-    } else {
-      const response = await this.client.databases.query({
-        database_id: this.config.databaseId,
-        filter: {
-          property: this.config.titleProperty,
-          title: {
-            contains: taskIdentifier,
-          },
-        },
-      });
+  async getStats(): Promise<{
+    total: number;
+    byStatus: Record<string, number>;
+    byPriority: Record<string, number>;
+    recentlyUpdated: number;
+    archived: number;
+  }> {
+    return this.executeWithResilience(async () => {
+      const allTasks = await this.list({ includeArchived: true });
+      const now = Date.now();
+      const dayMs = 24 * 60 * 60 * 1000;
 
-      if (response.results.length === 0) {
-        throw new Error(`Task "${taskIdentifier}" not found in database`);
-      }
-      
-      pageId = response.results[0].id;
-    }
-
-    const pageContent = await this.getPageContent(pageId);
-    const { objective, userFlow } = this.extractObjectiveAndUserFlow({}, pageContent);
-    
-    return {
-      objective,
-      userFlow,
-      fullContent: pageContent
-    };
-  }
-
-  /**
-   * Create a new task
-   */
-  async createTask(title: string, status = "Planned", properties: Record<string, any> = {}): Promise<RoadmapTask> {
-    const today = new Date().toISOString().split('T')[0];
-    
-    const taskProperties: any = {
-      [this.config.titleProperty]: {
-        title: [
-          {
-            text: {
-              content: title,
-            },
-          },
-        ],
-      },
-      [this.config.statusProperty]: {
-        status: { name: status },
-      },
-      ...properties,
-    };
-
-    // Add date for completed or in-progress tasks
-    if (status.toLowerCase() === 'completed' || status.toLowerCase() === 'in progress') {
-      taskProperties[this.config.dateProperty] = {
-        date: {
-          start: today,
-        },
+      const stats = {
+        total: allTasks.length,
+        byStatus: {} as Record<string, number>,
+        byPriority: {} as Record<string, number>,
+        recentlyUpdated: 0,
+        archived: 0
       };
-    }
 
-    const response = await this.client.pages.create({
-      parent: {
-        type: 'database_id',
-        database_id: this.config.databaseId,
-      },
-      properties: taskProperties,
-    });
-
-    return this.formatTask(response as any, '');
-  }
-
-  /**
-   * Get page content (blocks) from a Notion page
-   */
-  private async getPageContent(pageId: string): Promise<string> {
-    try {
-      const response = await this.client.blocks.children.list({
-        block_id: pageId,
-      });
-      
-      return this.extractTextFromBlocks(response.results);
-    } catch (error) {
-      console.warn(`Could not fetch page content for ${pageId}:`, error);
-      return '';
-    }
-  }
-
-  /**
-   * Extract text content from Notion blocks
-   */
-  private extractTextFromBlocks(blocks: any[]): string {
-    const textContent: string[] = [];
-    
-    blocks.forEach(block => {
-      if (block.type === 'paragraph' && block.paragraph?.rich_text) {
-        const text = block.paragraph.rich_text.map((t: any) => t.plain_text).join('');
-        if (text.trim()) textContent.push(text.trim());
-      }
-      if (block.type === 'heading_1' && block.heading_1?.rich_text) {
-        const text = block.heading_1.rich_text.map((t: any) => t.plain_text).join('');
-        if (text.trim()) textContent.push(`# ${text.trim()}`);
-      }
-      if (block.type === 'heading_2' && block.heading_2?.rich_text) {
-        const text = block.heading_2.rich_text.map((t: any) => t.plain_text).join('');
-        if (text.trim()) textContent.push(`## ${text.trim()}`);
-      }
-      if (block.type === 'heading_3' && block.heading_3?.rich_text) {
-        const text = block.heading_3.rich_text.map((t: any) => t.plain_text).join('');
-        if (text.trim()) textContent.push(`### ${text.trim()}`);
-      }
-      if (block.type === 'bulleted_list_item' && block.bulleted_list_item?.rich_text) {
-        const text = block.bulleted_list_item.rich_text.map((t: any) => t.plain_text).join('');
-        if (text.trim()) textContent.push(`• ${text.trim()}`);
-      }
-      if (block.type === 'numbered_list_item' && block.numbered_list_item?.rich_text) {
-        const text = block.numbered_list_item.rich_text.map((t: any) => t.plain_text).join('');
-        if (text.trim()) textContent.push(`1. ${text.trim()}`);
-      }
-    });
-    
-    return textContent.join('\n');
-  }
-
-  /**
-   * Format a Notion page into a RoadmapTask
-   */
-  private formatTask(page: any, pageContent: string = ''): RoadmapTask {
-    return {
-      id: page.id,
-      title: this.extractTitle(page),
-      status: this.extractStatus(page),
-      priority: this.extractPriority(page),
-      url: page.url,
-      objective: this.extractObjectiveAndUserFlow(page, pageContent).objective,
-      userFlow: this.extractObjectiveAndUserFlow(page, pageContent).userFlow,
-      description: this.extractRichText(page, 'Description'),
-      effort: this.extractSelect(page, 'Effort'),
-      dependencies: this.extractRichText(page, 'Dependencies'),
-      dueDate: this.extractDate(page, 'Due Date'),
-      properties: page.properties,
-    };
-  }
-
-  private extractTitle(page: any): string {
-    const prop = page.properties[this.config.titleProperty];
-    if (prop?.type === 'title' && prop.title?.length > 0) {
-      return prop.title[0].plain_text;
-    }
-    return 'Untitled';
-  }
-
-  private extractStatus(page: any): string {
-    const prop = page.properties[this.config.statusProperty];
-    return prop?.status?.name || 'Unknown';
-  }
-
-  private extractPriority(page: any): string | undefined {
-    const prop = page.properties['Priority'];
-    return prop?.select?.name;
-  }
-
-  private extractRichText(page: any, propertyName: string): string | undefined {
-    const prop = page.properties[propertyName];
-    if (prop?.type === 'rich_text' && prop.rich_text?.length > 0) {
-      // Concatenate all rich text blocks for complete content
-      return prop.rich_text.map((block: any) => block.plain_text).join('');
-    }
-    return undefined;
-  }
-
-  private extractSelect(page: any, propertyName: string): string | undefined {
-    const prop = page.properties[propertyName];
-    return prop?.select?.name;
-  }
-
-  private extractDate(page: any, propertyName: string): string | undefined {
-    const prop = page.properties[propertyName];
-    return prop?.date?.start;
-  }
-
-  private extractMultiSelect(page: any, propertyName: string): string[] | undefined {
-    const prop = page.properties[propertyName];
-    if (prop?.type === 'multi_select' && prop.multi_select?.length > 0) {
-      return prop.multi_select.map((item: any) => item.name);
-    }
-    return undefined;
-  }
-
-  private extractPeople(page: any, propertyName: string): string[] | undefined {
-    const prop = page.properties[propertyName];
-    if (prop?.type === 'people' && prop.people?.length > 0) {
-      return prop.people.map((person: any) => person.name || person.id);
-    }
-    return undefined;
-  }
-
-  private extractObjectiveAndUserFlow(page: any, pageContent: string): { objective?: string; userFlow?: string } {
-    // Parse the page content to extract objective and user flow
-    const lines = pageContent.split('\n').map(line => line.trim()).filter(line => line);
-    
-    let objective: string | undefined;
-    let userFlow: string | undefined;
-    let currentSection = '';
-    let collectingObjective = false;
-    let collectingUserFlow = false;
-    
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const lowerLine = line.toLowerCase();
-      
-      // Check for section headers
-      if (lowerLine.includes('objective') && (lowerLine.includes('#') || lowerLine.includes(':'))) {
-        currentSection = 'objective';
-        collectingObjective = true;
-        collectingUserFlow = false;
+      for (const task of allTasks) {
+        // Count by status
+        stats.byStatus[task.status] = (stats.byStatus[task.status] || 0) + 1;
         
-        // Extract content from same line if it has content after ":"
-        if (line.includes(':')) {
-          const content = line.split(':').slice(1).join(':').trim();
-          if (content && !content.startsWith('#')) {
-            objective = content;
-            collectingObjective = false;
-          }
+        // Count by priority
+        if (task.priority) {
+          stats.byPriority[task.priority] = (stats.byPriority[task.priority] || 0) + 1;
         }
-        continue;
-      }
-      
-      if ((lowerLine.includes('user flow') || lowerLine.includes('flow')) && 
-          (lowerLine.includes('#') || lowerLine.includes(':'))) {
-        currentSection = 'userflow';
-        collectingUserFlow = true;
-        collectingObjective = false;
         
-        // Extract content from same line if it has content after ":"
-        if (line.includes(':')) {
-          const content = line.split(':').slice(1).join(':').trim();
-          if (content && !content.startsWith('#')) {
-            userFlow = content;
-            collectingUserFlow = false;
-          }
-        }
-        continue;
-      }
-      
-      // Stop collecting if we hit another section header
-      if (line.startsWith('#') || (line.includes(':') && line.split(':')[0].length < 50)) {
-        collectingObjective = false;
-        collectingUserFlow = false;
-        currentSection = '';
-      }
-      
-      // Collect content for current section
-      if (collectingObjective && line && !line.startsWith('#')) {
-        objective = objective ? `${objective} ${line}` : line;
-      }
-      
-      if (collectingUserFlow && line && !line.startsWith('#')) {
-        userFlow = userFlow ? `${userFlow} ${line}` : line;
-      }
-    }
-    
-    // Fallback: check properties if no content found
-    if (!objective && !userFlow) {
-      const docsContent = this.extractRichText(page, 'Docs');
-      if (docsContent) {
-        const docLines = docsContent.split('\n').map(line => line.trim()).filter(line => line);
-        for (const line of docLines) {
-          const lowerLine = line.toLowerCase();
-          if (lowerLine.includes('objective') && line.includes(':')) {
-            objective = line.split(':').slice(1).join(':').trim();
-          }
-          if (lowerLine.includes('user flow') && line.includes(':')) {
-            userFlow = line.split(':').slice(1).join(':').trim();
-          }
+        // Count archived
+        if ((task.properties as any).archived?.checkbox) {
+          stats.archived++;
         }
       }
-      
-      // Final fallback: separate properties
-      if (!objective) {
-        objective = this.extractRichText(page, 'Objective');
-      }
-      if (!userFlow) {
-        userFlow = this.extractRichText(page, 'User Flow');
-      }
-    }
-    
-    return { objective, userFlow };
+
+      return stats;
+    }, 'getStats');
   }
 
   /**
-   * Update content blocks with new objective, user flow, and notes
+   * Export tasks to CSV format
    */
-  private updateContentBlocks(existingBlocks: any[], newContent: { objective?: string; userFlow?: string; notes?: string }): any[] {
-    const blocks: any[] = [];
+  async exportCSV(options?: { includeArchived?: boolean }): Promise<string> {
+    const tasks = await this.list(options);
     
-    // Add objective section
-    if (newContent.objective) {
-      blocks.push({
-        object: 'block',
-        type: 'heading_2',
-        heading_2: {
-          rich_text: [{
-            type: 'text',
-            text: { content: '1. Objective' }
-          }]
-        }
-      });
-      
-      blocks.push({
-        object: 'block',
-        type: 'paragraph',
-        paragraph: {
-          rich_text: [{
-            type: 'text',
-            text: { content: newContent.objective }
-          }]
-        }
-      });
-    }
-    
-    // Add user flow section
-    if (newContent.userFlow) {
-      blocks.push({
-        object: 'block',
-        type: 'heading_2',
-        heading_2: {
-          rich_text: [{
-            type: 'text',
-            text: { content: '2. User Flow from Start to Renewal' }
-          }]
-        }
-      });
-      
-      blocks.push({
-        object: 'block',
-        type: 'paragraph',
-        paragraph: {
-          rich_text: [{
-            type: 'text',
-            text: { content: newContent.userFlow }
-          }]
-        }
-      });
-    }
-    
-    // Add notes section
-    if (newContent.notes) {
-      blocks.push({
-        object: 'block',
-        type: 'heading_2',
-        heading_2: {
-          rich_text: [{
-            type: 'text',
-            text: { content: '3. Implementation Notes' }
-          }]
-        }
-      });
-      
-      // Split notes by newlines and create paragraphs
-      const noteLines = newContent.notes.split('\n').filter(line => line.trim());
-      for (const line of noteLines) {
-        if (line.startsWith('- ') || line.startsWith('• ')) {
-          // Create bullet point
-          blocks.push({
-            object: 'block',
-            type: 'bulleted_list_item',
-            bulleted_list_item: {
-              rich_text: [{
-                type: 'text',
-                text: { content: line.replace(/^[•-]\s*/, '') }
-              }]
-            }
-          });
-        } else if (line.match(/^\d+\.\s/)) {
-          // Create numbered list item
-          blocks.push({
-            object: 'block',
-            type: 'numbered_list_item',
-            numbered_list_item: {
-              rich_text: [{
-                type: 'text',
-                text: { content: line.replace(/^\d+\.\s*/, '') }
-              }]
-            }
-          });
-        } else if (line.startsWith('#')) {
-          // Create heading
-          const level = line.match(/^#+/)?.[0].length || 1;
-          const headingType = level === 1 ? 'heading_1' : level === 2 ? 'heading_2' : 'heading_3';
-          blocks.push({
-            object: 'block',
-            type: headingType,
-            [headingType]: {
-              rich_text: [{
-                type: 'text',
-                text: { content: line.replace(/^#+\s*/, '') }
-              }]
-            }
-          });
-        } else {
-          // Create regular paragraph
-          blocks.push({
-            object: 'block',
-            type: 'paragraph',
-            paragraph: {
-              rich_text: [{
-                type: 'text',
-                text: { content: line }
-              }]
-            }
-          });
-        }
-      }
-    }
-    
-    return blocks;
+    const headers = ['ID', 'Title', 'Status', 'Priority', 'URL'];
+    const rows = tasks.map(task => [
+      task.id,
+      task.title,
+      task.status,
+      task.priority || '',
+      task.url
+    ]);
+
+    const csv = [
+      headers.join(','),
+      ...rows.map(row => row.map(cell => `"${cell}"`).join(','))
+    ].join('\n');
+
+    return csv;
   }
 
   /**
-   * Replace all content in a page
+   * Get all unique statuses in the database
    */
-  private async replacePageContent(pageId: string, newBlocks: any[]): Promise<void> {
-    // First, get all existing blocks
-    const existingBlocks = await this.client.blocks.children.list({
-      block_id: pageId,
-    });
-
-    // Delete existing blocks
-    for (const block of existingBlocks.results) {
-      try {
-        await this.client.blocks.delete({
-          block_id: (block as any).id,
-        });
-      } catch (error) {
-        console.warn(`Could not delete block ${(block as any).id}:`, error);
-      }
-    }
-
-    // Add new blocks
-    if (newBlocks.length > 0) {
-      await this.client.blocks.children.append({
-        block_id: pageId,
-        children: newBlocks,
-      });
-    }
+  async getUniqueStatuses(): Promise<string[]> {
+    const tasks = await this.list();
+    const statuses = new Set(tasks.map(t => t.status).filter(Boolean));
+    return Array.from(statuses).sort();
   }
 }
 
 /**
- * Factory function for easy setup
+ * Factory function with validation
  */
 export function createRoadmapManager(config: RoadmapConfig): NotionRoadmapManager {
   if (!config.apiKey) {
-    throw new Error('Notion API key is required');
+    throw new CcnError({
+      type: 'Validation',
+      message: 'Notion API key is required',
+      retryable: false,
+      correlationId: generateCorrelationId()
+    });
   }
   if (!config.databaseId) {
-    throw new Error('Notion database ID is required');
+    throw new CcnError({
+      type: 'Validation',
+      message: 'Notion database ID is required',
+      retryable: false,
+      correlationId: generateCorrelationId()
+    });
   }
   
   return new NotionRoadmapManager(config);
 }
 
 /**
- * Create a roadmap manager from environment variables
+ * Create from environment with validation
  */
-export function createRoadmapFromEnv(databaseId: string, apiKeyEnv = 'NOTION_API_KEY'): NotionRoadmapManager {
+export function createRoadmapFromEnv(
+  databaseId: string,
+  options?: EnterpriseOptions,
+  apiKeyEnv = 'NOTION_API_KEY'
+): NotionRoadmapManager {
   const apiKey = process.env[apiKeyEnv];
   if (!apiKey) {
-    throw new Error(`Environment variable ${apiKeyEnv} is required`);
+    throw new CcnError({
+      type: 'Validation',
+      message: `Environment variable ${apiKeyEnv} is required`,
+      retryable: false,
+      correlationId: generateCorrelationId()
+    });
   }
   
   return createRoadmapManager({
     apiKey,
     databaseId,
+    enterprise: options
   });
 }
 
-// Types are already exported above as interfaces
+// Export everything for backward compatibility
+export * from './errors';
+export * from './circuit-breaker';
+export * from './utils';

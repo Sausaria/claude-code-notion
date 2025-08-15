@@ -1,0 +1,29 @@
+feat: v2.0.1 - Enterprise hardening with production-grade resilience
+
+🛡️ Production Hardening
+- Add request timeouts (15s default, configurable)
+- Implement circuit breaker with auto-recovery
+- Create typed error taxonomy with exit codes (0-8)
+- Add correlation IDs for request tracing
+- Implement kill switches (CCN_WRITE_DISABLED, CCN_NETWORK_DISABLED)
+- Add health check endpoint
+- Implement idempotency with 60s TTL
+
+📋 Notion API Best Practices
+- Pin API version via NOTION_VERSION header
+- Add automatic cursor pagination everywhere
+- Use property IDs for rename resilience
+- Add preflight archive/permission checks
+- Enhance search with filters and sorts
+- Honor Retry-After headers
+
+⚡ New Features
+- Batch operations with partial failure handling
+- CSV export functionality
+- Status discovery API
+- Statistics aggregation
+- Enhanced CLI commands
+
+BREAKING CHANGES: None - 100% backward compatible
+
+Co-authored-by: Claude <noreply@anthropic.com>
