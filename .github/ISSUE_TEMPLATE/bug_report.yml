@@ -1,0 +1,52 @@
+name: "🐞 Bug report"
+description: Report a bug to help us improve
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: "Paste the CLI/SDK command + output (mask secrets). Include correlationId if present."
+      placeholder: |
+        $ npx claude-code-notion complete "Task" --json
+        {
+          "success": false,
+          "error": "...",
+          "correlationId": "ccn-1234567890-abcd"
+        }
+    validations:
+      required: true
+  
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: "2.0.1"
+    validations:
+      required: true
+      
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js version
+      placeholder: "18 / 20"
+      
+  - type: textarea
+    id: repro-steps
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Set environment: `export NOTION_API_KEY="secret_xxx"`
+        2. Run command: `npx claude-code-notion ...`
+        3. Expected: ...
+        4. Actual: ...
+        
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: "OS, CI vendor, Docker image, etc."
+      placeholder: |
+        OS: macOS 14.0
+        CI: GitHub Actions ubuntu-latest
+        Docker: node:20-alpine

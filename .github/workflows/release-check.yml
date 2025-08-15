@@ -1,0 +1,21 @@
+name: Release checks
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: 
+          node-version: 20
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+      - run: npm pack --dry-run
+      - run: node -e "const {createRoadmapManager} = require('./dist/index.js'); console.log('✅ SDK import OK')"
+      - run: node -e "const {CcnError} = require('./dist/errors.js'); console.log('✅ Error types OK')"
+      - run: ./bin/claude-code-notion --help | head -n 5
+      - run: echo "✅ Release v${{ github.ref_name }} smoke tests passed"

@@ -14,6 +14,8 @@
 npm install claude-code-notion
 ```
 
+> **Reproducible builds**: `npm install claude-code-notion@^2.0.1`
+
 ## ⚡ Quickstart
 
 ```bash
@@ -656,6 +658,52 @@ npx claude-code-notion complete "Deploy X" --json --idempotent > audit.log
 - **Access Control**: Integration-based permissions model via Notion
 - **Error Handling**: Comprehensive error classification and logging
 - **Monitoring Ready**: JSON output integrates with SIEM/monitoring systems
+
+## 🔧 Compatibility
+
+| Component | Supported Versions |
+|-----------|-------------------|
+| **Node.js** | 18, 20 (tested in CI) |
+| **Notion API** | 2022-06-28 (pinned via header) |
+| **OS** | macOS, Linux, Windows |
+| **TypeScript** | 4.9+ (optional) |
+
+## 🛠️ Troubleshooting
+
+### Get Detailed Logs
+```bash
+# Export JSON logs with correlation ID
+npx claude-code-notion search "example" --json --debug 2>ccn.err.json
+
+# Share the correlationId + redacted error JSON in issues
+```
+
+### Verify Installation
+```bash
+npm view claude-code-notion@latest version dist-tags
+# Should show: latest: '2.0.1'
+```
+
+### Common Issues
+
+| Error | Solution |
+|-------|----------|
+| `401 Unauthorized` | Check `NOTION_API_KEY` format: `secret_xxx` |
+| `404 Not Found` | Verify database is shared with integration |
+| `403 Forbidden` | Database may be archived or access revoked |
+| `Circuit Open` | Service recovering from failures, retry in 60s |
+
+## 🔒 Privacy & Security
+
+- **Telemetry**: None - no usage data collected
+- **Secrets**: Auto-redacted in all logs and outputs
+- **2FA**: NPM account secured with two-factor authentication
+- **Idempotency**: Prevents duplicate operations by default in enterprise mode
+
+## 📋 Releases
+
+- **Latest**: [v2.0.1](./CHANGELOG-2.0.1.md) - Enterprise hardening & API best practices
+- **Previous**: [v2.0.0](https://github.com/Sausaria/claude-code-notion/releases/tag/v2.0.0) - Enterprise features
 
 ## License
 
