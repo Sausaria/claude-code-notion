@@ -1,0 +1,282 @@
+#!/usr/bin/env node
+
+/**
+ * Claude Code Notion CLI
+ * Enterprise-grade command line interface for Notion roadmap management
+ */
+
+const { createRoadmapFromEnv, defaultLogger } = require('../dist/index.js');
+
+// Environment validation
+function validateEnv() {
+  const apiKey = process.env.NOTION_API_KEY;
+  const databaseId = process.env.NOTION_DATABASE_ID;
+  
+  if (!apiKey) {
+    console.error('❌ Missing NOTION_API_KEY environment variable');
+    process.exit(1);
+  }
+  
+  if (!databaseId) {
+    console.error('❌ Missing NOTION_DATABASE_ID environment variable');
+    process.exit(1);
+  }
+  
+  // Reject placeholder values
+  if (apiKey.includes('your_') || apiKey.includes('placeholder')) {
+    console.error('❌ NOTION_API_KEY appears to be a placeholder value');
+    console.error('   Please set a real Notion integration token');
+    process.exit(1);
+  }
+  
+  if (databaseId.includes('your_') || databaseId.includes('placeholder')) {
+    console.error('❌ NOTION_DATABASE_ID appears to be a placeholder value');
+    console.error('   Please set a real Notion database ID');
+    process.exit(1);
+  }
+  
+  return { apiKey, databaseId };
+}
+
+// Parse CLI arguments
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const flags = {
+    dryRun: args.includes('--dry-run'),
+    json: args.includes('--json'),
+    help: args.includes('--help'),
+    retries: parseInt(args.find(arg => arg.startsWith('--retries='))?.split('=')[1] || '3'),
+    idempotent: args.includes('--idempotent'),
+    pageId: args.includes('--page-id')
+  };
+  
+  const cleanArgs = args.filter(arg => !arg.startsWith('--'));
+  const command = cleanArgs[0];
+  
+  return { command, args: cleanArgs.slice(1), flags };
+}
+
+// JSON logger for CLI
+const jsonLogger = {
+  info: (msg, meta) => {
+    if (meta?.json) {
+      console.log(JSON.stringify({ level: 'info', message: msg, ...meta }));
+    } else {
+      console.log(`[INFO] ${msg}`);
+    }
+  },
+  warn: (msg, meta) => {
+    if (meta?.json) {
+      console.log(JSON.stringify({ level: 'warn', message: msg, ...meta }));
+    } else {
+      console.warn(`[WARN] ${msg}`);
+    }
+  },
+  error: (msg, meta) => {
+    if (meta?.json) {
+      console.log(JSON.stringify({ level: 'error', message: msg, ...meta }));
+    } else {
+      console.error(`[ERROR] ${msg}`);
+    }
+  },
+  event: (type, meta) => {
+    if (meta?.json) {
+      console.log(JSON.stringify({ level: 'event', type, ...meta }));
+    }
+  }
+};
+
+// Show help
+function showHelp() {
+  console.log(`
+🚀 Claude Code Notion CLI - Enterprise Notion Integration
+
+Usage:
+  claude-code-notion <command> [args] [flags]
+
+Commands:
+  search <query>                    Search for tasks
+  complete <pageId|title>           Mark task as completed  
+  update-content <pageId|title> --objective "..." --user-flow "..."
+                                   Update page content
+  update-status <pageId|title> <status>
+                                   Update task status
+  ensure <title>                   Ensure task exists (create if missing)
+
+Flags:
+  --dry-run                        Preview changes without writing
+  --json                           Output structured JSON logs
+  --idempotent                     Skip writes when values unchanged
+  --retries=N                      Max retry attempts (default: 3)
+  --page-id                        Treat identifier as page ID
+  --help                           Show this help
+
+Examples:
+  claude-code-notion search "Security Fixes" --json
+  claude-code-notion complete "Security Fixes" --dry-run --idempotent
+  claude-code-notion update-content "Task" --objective "New goal" --user-flow "New flow"
+  claude-code-notion update-status "Security Fixes" "Completed"
+  claude-code-notion ensure "New Feature" --dry-run
+
+Environment Variables:
+  NOTION_API_KEY                   Notion integration token (secret_... or ntn_...)
+  NOTION_DATABASE_ID               Target database UUID
+  `);
+}
+
+// Main CLI function
+async function main() {
+  const { command, args, flags } = parseArgs();
+  
+  if (flags.help || !command) {
+    showHelp();
+    return;
+  }
+  
+  try {
+    const { apiKey, databaseId } = validateEnv();
+    
+    // Create manager with enterprise options
+    const { createRoadmapManager } = require('../dist/index.js');
+    const manager = createRoadmapManager({
+      apiKey,
+      databaseId,
+      enterprise: {
+        dryRun: flags.dryRun,
+        logger: flags.json ? jsonLogger : defaultLogger,
+        retries: {
+          attempts: flags.retries,
+        },
+        idempotency: {
+          enabled: flags.idempotent
+        }
+      }
+    });
+    
+    let result;
+    
+    switch (command) {
+      case 'search':
+        if (!args[0]) {
+          console.error('❌ Usage: search <query>');
+          process.exit(1);
+        }
+        result = await manager.search(args[0]);
+        if (flags.json) {
+          console.log(JSON.stringify({ success: true, results: result }, null, 2));
+        } else {
+          console.log(`Found ${result.length} matching task(s):`);
+          result.forEach(task => {
+            console.log(`📄 ${task.title} (${task.status}) - ${task.url}`);
+            if (task.objective) console.log(`   📋 ${task.objective}`);
+          });
+        }
+        break;
+        
+      case 'complete':
+        if (!args[0]) {
+          console.error('❌ Usage: complete <pageId|title>');
+          process.exit(1);
+        }
+        result = await manager.complete(args[0]);
+        if (flags.json) {
+          console.log(JSON.stringify({ success: true, result }, null, 2));
+        } else {
+          console.log('✅ Task completed successfully');
+        }
+        break;
+        
+      case 'update-content':
+        if (!args[0]) {
+          console.error('❌ Usage: update-content <pageId|title> --objective "..." --user-flow "..."');
+          process.exit(1);
+        }
+        
+        const objective = process.argv.find(arg => arg.startsWith('--objective='))?.split('=').slice(1).join('=');
+        const userFlow = process.argv.find(arg => arg.startsWith('--user-flow='))?.split('=').slice(1).join('=');
+        
+        if (!objective && !userFlow) {
+          console.error('❌ At least one of --objective or --user-flow must be provided');
+          process.exit(1);
+        }
+        
+        await manager.updatePageContent(args[0], { objective, userFlow });
+        if (flags.json) {
+          console.log(JSON.stringify({ success: true }, null, 2));
+        } else {
+          console.log('📝 Content updated successfully');
+        }
+        break;
+        
+      case 'update-status':
+        if (!args[0] || !args[1]) {
+          console.error('❌ Usage: update-status <pageId|title> <status>');
+          process.exit(1);
+        }
+        result = await manager.updateTask(args[0], args[1]);
+        if (flags.json) {
+          console.log(JSON.stringify({ success: true, result }, null, 2));
+        } else {
+          console.log('🔧 Status updated successfully');
+        }
+        break;
+        
+      case 'ensure':
+        if (!args[0]) {
+          console.error('❌ Usage: ensure <title>');
+          process.exit(1);
+        }
+        
+        // Check if task exists
+        const existing = await manager.search(args[0]);
+        if (existing.length > 0) {
+          result = existing[0];
+          if (flags.json) {
+            console.log(JSON.stringify({ success: true, result, created: false }, null, 2));
+          } else {
+            console.log('🔍 Task already exists');
+          }
+        } else {
+          if (flags.dryRun) {
+            if (flags.json) {
+              console.log(JSON.stringify({ success: true, dryRun: true, wouldCreate: args[0] }, null, 2));
+            } else {
+              console.log(`[DRY RUN] Would create task: ${args[0]}`);
+            }
+          } else {
+            result = await manager.createTask(args[0], 'Planned');
+            if (flags.json) {
+              console.log(JSON.stringify({ success: true, result, created: true }, null, 2));
+            } else {
+              console.log('🧩 Task created successfully');
+            }
+          }
+        }
+        break;
+        
+      default:
+        console.error(`❌ Unknown command: ${command}`);
+        console.error('   Use --help for available commands');
+        process.exit(1);
+    }
+    
+  } catch (error) {
+    if (flags.json) {
+      console.log(JSON.stringify({
+        success: false,
+        error: {
+          message: error.message,
+          code: error.code,
+          status: error.status
+        }
+      }, null, 2));
+    } else {
+      console.error(`❌ Error: ${error.message}`);
+    }
+    process.exit(1);
+  }
+}
+
+if (require.main === module) {
+  main();
+}

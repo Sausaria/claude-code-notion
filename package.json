@@ -1,0 +1,58 @@
+{
+  "name": "claude-code-notion",
+  "version": "2.0.0",
+  "description": "Enterprise-grade TypeScript library for Notion database management with Claude Code integration. Features retry/backoff, idempotency, dry-run mode, structured logging, and CLI.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "claude-code-notion": "./bin/claude-code-notion"
+  },
+  "files": [
+    "dist",
+    "bin"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build",
+    "test": "jest",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "notion",
+    "claude-code",
+    "project-management",
+    "typescript",
+    "productivity",
+    "api",
+    "database",
+    "enterprise",
+    "cli",
+    "retry",
+    "idempotency",
+    "dry-run",
+    "logging"
+  ],
+  "author": "Daniel Harris",
+  "license": "MIT",
+  "dependencies": {
+    "@notionhq/client": "^2.2.15"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "jest": "^29.0.0",
+    "@types/jest": "^29.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/danielharris/claude-code-notion.git"
+  },
+  "bugs": {
+    "url": "https://github.com/danielharris/claude-code-notion/issues"
+  },
+  "homepage": "https://github.com/danielharris/claude-code-notion#readme"
+}
