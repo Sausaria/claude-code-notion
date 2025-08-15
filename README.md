@@ -137,7 +137,7 @@ const fullData = await roadmap.getFullProjectData("Agent License Renewal");
     priority: "Medium",
     effort: "M",
     team: ["Backend", "Frontend"],
-    owner: ["Daniel Harris"],
+    owner: ["Name"],
     category: ["Compliance"],
     role: ["Student"],
     quarter: ["Q1 2025"],
